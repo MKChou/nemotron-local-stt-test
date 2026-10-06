@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -176,13 +177,6 @@ def stream_transcribe(language: str = LANGUAGE) -> str:
     mic_stream = MicrophoneStream(mic)
     mic_stream.start()
 
-    def wait_for_stop() -> None:
-        input()
-        stop_requested.set()
-        mic_stream.stop()
-
-    threading.Thread(target=wait_for_stop, daemon=True).start()
-
     first_audio = mic_stream.read_samples(processor.num_samples_first_audio_chunk)
     if first_audio is None or len(first_audio) == 0:
         mic_stream.stop()
@@ -257,20 +251,43 @@ def stream_transcribe(language: str = LANGUAGE) -> str:
         "streamer": streamer,
     }
 
-    print("[Live] ", end="", flush=True)
     parts: list[str] = []
-    generate_thread = threading.Thread(target=model.generate, kwargs=generate_kwargs)
-    generate_thread.start()
+    errors: list[BaseException] = []
 
-    try:
+    def run_generate() -> None:
+        try:
+            model.generate(**generate_kwargs)
+        except BaseException as e:
+            # Without this the streamer never ends and the consumer blocks forever.
+            errors.append(e)
+            streamer.end()
+
+    def consume() -> None:
         for text_chunk in streamer:
             print(text_chunk, end="", flush=True)
             parts.append(text_chunk)
+        if not stop_requested.is_set():
+            print("\n(Stream ended. Press Enter to continue.)", flush=True)
+
+    print("[Live] ", end="", flush=True)
+    generate_thread = threading.Thread(target=run_generate, daemon=True)
+    consume_thread = threading.Thread(target=consume, daemon=True)
+    generate_thread.start()
+    consume_thread.start()
+
+    # stdin is only ever read on the main thread, so a stream that ends on its
+    # own cannot leave a listener behind to swallow the next prompt's Enter.
+    try:
+        input()
     finally:
+        stop_requested.set()
         mic_stream.stop()
         generate_thread.join(timeout=30)
+        consume_thread.join(timeout=30)
 
     print()
+    if errors:
+        raise RuntimeError(f"Transcription failed: {errors[0]}") from errors[0]
     return "".join(parts).strip()
 
 
@@ -281,27 +298,26 @@ def record(duration: float) -> str:
     tmp.close()
 
     print(f"Recording {duration}s ({mic})...")
-    subprocess.run(
-        [
-            find_ffmpeg(), "-y", "-loglevel", "error",
-            "-f", "dshow", "-i", f"audio={mic}",
-            "-t", str(duration), "-ac", "1", "-ar", str(SAMPLE_RATE),
-            wav_path,
-        ],
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [
+                find_ffmpeg(), "-y", "-loglevel", "error",
+                "-f", "dshow", "-i", f"audio={mic}",
+                "-t", str(duration), "-ac", "1", "-ar", str(SAMPLE_RATE),
+                wav_path,
+            ],
+            check=True,
+        )
+    except BaseException:
+        Path(wav_path).unlink(missing_ok=True)
+        raise
     print("Recording done.")
     return wav_path
 
 
 def prepare_audio(wav_path: str) -> np.ndarray:
-    audio, sr = sf.read(wav_path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-
-    if sr != SAMPLE_RATE:
-        import librosa
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+    # record() always writes 16 kHz mono, so no downmix or resampling is needed.
+    audio, _ = sf.read(wav_path, dtype="float32")
 
     peak = np.max(np.abs(audio))
     if peak < 0.01:
@@ -332,17 +348,24 @@ def main():
     parser.add_argument(
         "--duration", "-d",
         type=float,
-        default=8.0,
+        default=None,
         help="Recording length in seconds for --batch mode (default: 8)",
     )
     args = parser.parse_args()
 
+    if args.duration is not None and not args.batch:
+        print(
+            "Warning: --duration only applies with --batch; ignoring it.",
+            file=sys.stderr,
+        )
+    duration = 8.0 if args.duration is None else args.duration
+
     print("=" * 40)
     if args.batch:
-        print("  Speech-to-Text (local GPU · 简体中文 · batch)")
-        print(f"  Duration: {args.duration}s")
+        print(f"  Speech-to-Text (local GPU · {LANGUAGE} · batch)")
+        print(f"  Duration: {duration}s")
     else:
-        print("  Speech-to-Text (local GPU · 简体中文 · streaming)")
+        print(f"  Speech-to-Text (local GPU · {LANGUAGE} · streaming)")
     print("=" * 40)
 
     load_model(streaming=not args.batch)
@@ -353,13 +376,17 @@ def main():
             if key == "q":
                 print("Bye.")
                 break
+            wav = None
             try:
-                wav = record(args.duration)
+                wav = record(duration)
                 print("Transcribing...")
                 result = transcribe_batch(wav)
                 print(f"\n[Result] {result or '(no speech detected)'}")
             except Exception as e:
                 print(f"\nError: {e}", file=sys.stderr)
+            finally:
+                if wav:
+                    Path(wav).unlink(missing_ok=True)
         return
 
     while True:
